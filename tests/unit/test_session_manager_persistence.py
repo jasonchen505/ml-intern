@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,11 @@ if str(_BACKEND_DIR) not in sys.path:
 from agent.core.model_ids import KIMI_K26_MODEL_ID  # noqa: E402
 from agent.core.session_persistence import NoopSessionStore  # noqa: E402
 from agent.core.usage_thresholds import USAGE_THRESHOLD_TOOL_NAME  # noqa: E402
-from session_manager import AgentSession, SessionManager  # noqa: E402
+from session_manager import (  # noqa: E402
+    AgentSession,
+    SessionManager,
+    new_inference_billing_session_id,
+)
 
 
 class FakeRuntimeSession:
@@ -146,6 +151,33 @@ def _runtime_agent_session(
     )
 
 
+def test_inference_billing_session_id_is_uuid_for_long_agent_session_ids():
+    billing_session_id = new_inference_billing_session_id(
+        "s" * 300,
+        datetime(2026, 6, 5, 12, 30, tzinfo=UTC),
+    )
+
+    assert str(uuid.UUID(billing_session_id)) == billing_session_id
+
+
+def test_agent_session_replaces_non_uuid_inference_billing_session_id():
+    runtime_session = FakeRuntimeSession()
+    agent_session = AgentSession(
+        session_id="s1",
+        session=runtime_session,  # type: ignore[arg-type]
+        tool_router=object(),  # type: ignore[arg-type]
+        submission_queue=asyncio.Queue(),
+        inference_billing_session_id="not-a-uuid",
+    )
+
+    assert str(uuid.UUID(agent_session.inference_billing_session_id)) == (
+        agent_session.inference_billing_session_id
+    )
+    assert runtime_session.inference_billing_session_id == (
+        agent_session.inference_billing_session_id
+    )
+
+
 @pytest.mark.asyncio
 async def test_reset_session_usage_window_updates_runtime_and_store():
     store = RestoreStore()
@@ -153,26 +185,34 @@ async def test_reset_session_usage_window_updates_runtime_and_store():
     agent_session = _runtime_agent_session("s1")
     manager.sessions["s1"] = agent_session
     started_at = datetime(2026, 6, 5, 12, 30, tzinfo=UTC)
-    baseline = {"captured_at": started_at, "total_usd": 1.25}
+    original_billing_session_id = agent_session.inference_billing_session_id
+    agent_session.usage_warning_spend_cache = {"spend_usd": 12.0}
 
     info = await manager.reset_session_usage_window(
         "s1",
         started_at=started_at,
-        baseline=baseline,
     )
 
     assert agent_session.usage_window_started_at == started_at
-    assert agent_session.usage_window_baseline == baseline
+    assert agent_session.inference_billing_session_id is not None
+    assert agent_session.inference_billing_session_id != original_billing_session_id
+    assert str(uuid.UUID(agent_session.inference_billing_session_id)) == (
+        agent_session.inference_billing_session_id
+    )
+    assert (
+        agent_session.session.inference_billing_session_id
+        == agent_session.inference_billing_session_id
+    )
+    assert agent_session.usage_warning_spend_cache == {}
     assert info is not None
     assert info["usage_window_started_at"] == started_at.isoformat()
-    assert store.updated_fields[-1] == (
-        "s1",
-        {
-            "usage_window_started_at": started_at,
-            "usage_window_baseline": baseline,
-            "last_active_at": agent_session.last_active_at,
-        },
-    )
+    session_id, fields = store.updated_fields[-1]
+    assert session_id == "s1"
+    assert fields == {
+        "usage_window_started_at": started_at,
+        "inference_billing_session_id": agent_session.inference_billing_session_id,
+        "last_active_at": agent_session.last_active_at,
+    }
 
 
 def test_usage_threshold_pending_approval_serializes_and_restores():
@@ -225,6 +265,26 @@ def test_usage_spend_prefers_hf_current_session_over_telemetry():
     )
 
     assert spend == 7.5
+    assert source == "hf_billing_current_session"
+
+
+def test_usage_spend_combines_hf_inference_with_telemetry_estimates():
+    spend, source = SessionManager._usage_spend_from_response(
+        {
+            "hf_account": {
+                "current_session": {
+                    "inference_providers_usd": 7.5,
+                },
+            },
+            "session": {
+                "total_usd": 99.0,
+                "hf_jobs_estimated_usd": 1.25,
+                "sandbox_estimated_usd": 0.5,
+            },
+        }
+    )
+
+    assert spend == 9.25
     assert source == "hf_billing_current_session"
 
 
